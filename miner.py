@@ -43,13 +43,6 @@ def iterative_sampling_loop(
     config: dict,
     save_all_scores: bool = False
 ) -> None:
-    """
-    Infinite loop, runs until orchestrator kills it:
-      1) Sample n molecules
-      2) Score them
-      3) Merge with previous top x, deduplicate, sort, select top x
-      4) Write top x to file (overwrite) each iteration
-    """
     target_models = []
     antitarget_models = []
 
