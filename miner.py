@@ -29,9 +29,6 @@ WRITE_TIME_THRESHOLD_2 = 25 * 60
 WRITE_EARLY_INTERVAL = 2
 
 def get_config(input_file: os.path = os.path.join(BASE_DIR, "input.json")):
-    """
-    Get config from input file
-    """
     with open(input_file, "r") as f:
         d = json.load(f)
     config = {**d.get("config", {}), **d.get("challenge", {})}
