@@ -72,7 +72,7 @@ def get_molecules_by_role(role_mask: int, db_path: str) -> List[Tuple[int, str, 
 def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: str, subnet_config: dict, 
                                  batch_size: int = 200, seed: int = None,
                                  elite_names: list[str] = None, elite_frac: float = 0.5, mutation_prob: float = 0.1,
-                                 avoid_inchikeys: set[str] = None) -> dict:
+                                 avoid_inchikeys: set[str] = None, component_weights: dict = None) -> dict:
     """
     Efficiently generate n_samples valid molecules by generating them in batches and validating.
     """
@@ -97,14 +97,16 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
     seen_keys = set()
     iteration = 0
 
-    progress_bar = tqdm(total=n_samples, desc="Creating valid molecules", unit="molecule", miniters=100, mininterval=0.5)
+    # Disable progress bar for faster iterations (can re-enable for debugging)
+    progress_bar = None  # tqdm(total=n_samples, desc="Creating valid molecules", unit="molecule", miniters=100, mininterval=0.5)
     
     while len(valid_molecules) < n_samples:
         iteration += 1
         
         needed = n_samples - len(valid_molecules)
         
-        batch_size_actual = min(batch_size, needed * 2)
+        # Increase batch size for faster generation (RTX 4090 can handle it)
+        batch_size_actual = min(max(batch_size, 300), needed * 2)
         
         emitted_names = set()
         if elite_names:
@@ -128,13 +130,13 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
             emitted_names.update(elite_batch)
 
             rand_batch = generate_molecules_from_pools(
-                rxn_id, n_rand, molecules_A, molecules_B, molecules_C, is_three_component, seed
+                rxn_id, n_rand, molecules_A, molecules_B, molecules_C, is_three_component, seed, component_weights
             )
             rand_batch = [n for n in rand_batch if n and (n not in emitted_names)]
             batch_molecules = elite_batch + rand_batch
         else:
             batch_molecules = generate_molecules_from_pools(
-                rxn_id, batch_size_actual, molecules_A, molecules_B, molecules_C, is_three_component, seed
+                rxn_id, batch_size_actual, molecules_A, molecules_B, molecules_C, is_three_component, seed, component_weights
             )
         
         batch_sampler_data = {"molecules": batch_molecules}
@@ -161,30 +163,60 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
             valid_smiles.append(s)
             added += 1
         
-        progress_bar.update(added)
+        if progress_bar:
+            progress_bar.update(added)
     
     final_molecules = valid_molecules[:n_samples]
     final_smiles = valid_smiles[:n_samples]
-    progress_bar.close()
+    if progress_bar:
+        progress_bar.close()
 
     return {"molecules": final_molecules,"smiles": final_smiles}
 
 
 def generate_molecules_from_pools(rxn_id: int, n: int, molecules_A: List[Tuple], molecules_B: List[Tuple], 
-                               molecules_C: List[Tuple], is_three_component: bool, seed: int = None) -> List[str]:
+                               molecules_C: List[Tuple], is_three_component: bool, seed: int = None,
+                               component_weights: dict = None) -> List[str]:
     rng = random.Random(seed) if seed is not None else random
 
     A_ids = [a[0] for a in molecules_A]
     B_ids = [b[0] for b in molecules_B]
     C_ids = [c[0] for c in molecules_C] if is_three_component else None
 
-    picks_A = rng.choices(A_ids, k=n)
-    picks_B = rng.choices(B_ids, k=n)
-    if is_three_component:
-        picks_C = rng.choices(C_ids, k=n)
-        names = [f"rxn:{rxn_id}:{a}:{b}:{c}" for a, b, c in zip(picks_A, picks_B, picks_C)]
+    # Use weighted sampling if component weights are provided
+    if component_weights:
+        # Build weights for each component pool
+        weights_A = [component_weights.get('A', {}).get(aid, 1.0) for aid in A_ids]
+        weights_B = [component_weights.get('B', {}).get(bid, 1.0) for bid in B_ids]
+        weights_C = [component_weights.get('C', {}).get(cid, 1.0) for cid in C_ids] if is_three_component else None
+        
+        # Normalize weights
+        if weights_A:
+            sum_w = sum(weights_A)
+            weights_A = [w / sum_w if sum_w > 0 else 1.0/len(weights_A) for w in weights_A]
+        if weights_B:
+            sum_w = sum(weights_B)
+            weights_B = [w / sum_w if sum_w > 0 else 1.0/len(weights_B) for w in weights_B]
+        if weights_C:
+            sum_w = sum(weights_C)
+            weights_C = [w / sum_w if sum_w > 0 else 1.0/len(weights_C) for w in weights_C]
+        
+        picks_A = rng.choices(A_ids, weights=weights_A, k=n) if weights_A else rng.choices(A_ids, k=n)
+        picks_B = rng.choices(B_ids, weights=weights_B, k=n) if weights_B else rng.choices(B_ids, k=n)
+        if is_three_component:
+            picks_C = rng.choices(C_ids, weights=weights_C, k=n) if weights_C else rng.choices(C_ids, k=n)
+            names = [f"rxn:{rxn_id}:{a}:{b}:{c}" for a, b, c in zip(picks_A, picks_B, picks_C)]
+        else:
+            names = [f"rxn:{rxn_id}:{a}:{b}" for a, b in zip(picks_A, picks_B)]
     else:
-        names = [f"rxn:{rxn_id}:{a}:{b}" for a, b in zip(picks_A, picks_B)]
+        # Uniform random sampling
+        picks_A = rng.choices(A_ids, k=n)
+        picks_B = rng.choices(B_ids, k=n)
+        if is_three_component:
+            picks_C = rng.choices(C_ids, k=n)
+            names = [f"rxn:{rxn_id}:{a}:{b}:{c}" for a, b, c in zip(picks_A, picks_B, picks_C)]
+        else:
+            names = [f"rxn:{rxn_id}:{a}:{b}" for a, b in zip(picks_A, picks_B)]
 
     names = list(dict.fromkeys(names))
     return names
@@ -288,7 +320,8 @@ def run_sampler(n_samples: int = 1000,
                 elite_names: list[str] = None,
                 elite_frac: float = 0.5,
                 mutation_prob: float = 0.1,
-                avoid_inchikeys: set[str] = None):
+                avoid_inchikeys: set[str] = None,
+                component_weights: dict = None):
     reactions = get_available_reactions(db_path)
     if not reactions:
         bt.logging.error("No reactions found in the database, check db path and integrity.")
@@ -298,10 +331,11 @@ def run_sampler(n_samples: int = 1000,
     bt.logging.info(f"Generating {n_samples} random molecules for reaction {rxn_id}")
 
     # Generate molecules with validation in batches for efficiency
+    # Increased batch size for RTX 4090 performance
     sampler_data = generate_valid_random_molecules_batch(
-        rxn_id, n_samples, db_path, subnet_config, batch_size=200, seed=seed,
+        rxn_id, n_samples, db_path, subnet_config, batch_size=300, seed=seed,
         elite_names=elite_names, elite_frac=elite_frac, mutation_prob=mutation_prob,
-        avoid_inchikeys=avoid_inchikeys
+        avoid_inchikeys=avoid_inchikeys, component_weights=component_weights
         )
 
     if save_to_file:
